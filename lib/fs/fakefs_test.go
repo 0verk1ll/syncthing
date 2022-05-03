@@ -10,7 +10,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
@@ -21,7 +20,7 @@ import (
 )
 
 func TestFakeFS(t *testing.T) {
-	// Test some basic aspects of the fakefs
+	// Test some basic aspects of the fakeFS
 
 	fs := newFakeFilesystem("/foo/bar/baz")
 
@@ -88,7 +87,7 @@ func TestFakeFS(t *testing.T) {
 	}
 
 	// Read
-	bs0, err := ioutil.ReadAll(fd)
+	bs0, err := io.ReadAll(fd)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +100,7 @@ func TestFakeFS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bs1, err := ioutil.ReadAll(fd)
+	bs1, err := io.ReadAll(fd)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +130,7 @@ func TestFakeFS(t *testing.T) {
 }
 
 func testFakeFSRead(t *testing.T, fs Filesystem) {
-	// Test some basic aspects of the fakefs
+	// Test some basic aspects of the fakeFS
 	// Create
 	fd, _ := fs.Create("test")
 	defer fd.Close()
@@ -139,7 +138,7 @@ func testFakeFSRead(t *testing.T, fs Filesystem) {
 
 	// Read
 	fd.Seek(0, io.SeekStart)
-	bs0, err := ioutil.ReadAll(fd)
+	bs0, err := io.ReadAll(fd)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +153,7 @@ func testFakeFSRead(t *testing.T, fs Filesystem) {
 	if n != len(buf0) {
 		t.Fatal("short read")
 	}
-	buf1, err := ioutil.ReadAll(fd)
+	buf1, err := io.ReadAll(fd)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,11 +200,10 @@ func TestFakeFSCaseSensitive(t *testing.T) {
 		{"FileName", testFakeFSFileName},
 	}
 	var filesystems = []testFS{
-		{"fakefs", newFakeFilesystem("/foo")},
+		{"fakeFS", newFakeFilesystem("/foo")},
 	}
 
 	testDir, sensitive := createTestDir(t)
-	defer removeTestDir(t, testDir)
 	if sensitive {
 		filesystems = append(filesystems, testFS{runtime.GOOS, newBasicFilesystem(testDir)})
 	}
@@ -237,11 +235,10 @@ func TestFakeFSCaseInsensitive(t *testing.T) {
 	}
 
 	var filesystems = []testFS{
-		{"fakefs", newFakeFilesystem("/foobar?insens=true")},
+		{"fakeFS", newFakeFilesystem("/foobar?insens=true")},
 	}
 
 	testDir, sensitive := createTestDir(t)
-	defer removeTestDir(t, testDir)
 	if !sensitive {
 		filesystems = append(filesystems, testFS{runtime.GOOS, newBasicFilesystem(testDir)})
 	}
@@ -252,10 +249,7 @@ func TestFakeFSCaseInsensitive(t *testing.T) {
 func createTestDir(t *testing.T) (string, bool) {
 	t.Helper()
 
-	testDir, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatalf("could not create temporary dir for testing: %s", err)
-	}
+	testDir := t.TempDir()
 
 	if fd, err := os.Create(filepath.Join(testDir, ".stfolder")); err != nil {
 		t.Fatalf("could not create .stfolder: %s", err)
@@ -272,14 +266,6 @@ func createTestDir(t *testing.T) (string, bool) {
 	}
 
 	return testDir, sensitive
-}
-
-func removeTestDir(t *testing.T, testDir string) {
-	t.Helper()
-
-	if err := os.RemoveAll(testDir); err != nil {
-		t.Fatalf("could not remove test directory: %s", err)
-	}
 }
 
 func runTests(t *testing.T, tests []test, filesystems []testFS) {
@@ -328,7 +314,7 @@ func testFakeFSCaseInsensitive(t *testing.T, fs Filesystem) {
 		t.Fatal(err)
 	}
 
-	bs2, err := ioutil.ReadAll(fd2)
+	bs2, err := io.ReadAll(fd2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -891,7 +877,7 @@ func testFakeFSCreateInsens(t *testing.T, fs Filesystem) {
 		t.Errorf("name of created file \"fOo\" is %s", fd2.Name())
 	}
 
-	// one would expect DirNames to show the last variant, but in fact it shows
+	// one would expect DirNames to show the last wrapperType, but in fact it shows
 	// the original one
 	assertDir(t, fs, "/", []string{"FOO"})
 }

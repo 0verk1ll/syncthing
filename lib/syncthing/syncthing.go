@@ -26,6 +26,7 @@ import (
 	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/connections"
+	"github.com/syncthing/syncthing/lib/connections/registry"
 	"github.com/syncthing/syncthing/lib/db"
 	"github.com/syncthing/syncthing/lib/db/backend"
 	"github.com/syncthing/syncthing/lib/discover"
@@ -110,7 +111,8 @@ func (a *App) Start() error {
 	a.stopped = make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	a.mainServiceCancel = cancel
-	go a.run(ctx)
+	errChan := a.mainService.ServeBackground(ctx)
+	go a.wait(errChan)
 
 	if err := a.startup(); err != nil {
 		a.stopWithErr(svcutil.ExitError, err)
@@ -205,7 +207,7 @@ func (a *App) startup() error {
 	folders := a.cfg.Folders()
 	for _, folder := range a.ll.ListFolders() {
 		if _, ok := folders[folder]; !ok {
-			l.Infof("Cleaning data for dropped folder %q", folder)
+			l.Infof("Cleaning metadata for dropped folder %q", folder)
 			db.DropFolder(a.ll, folder)
 		}
 	}
@@ -255,7 +257,13 @@ func (a *App) startup() error {
 	// The TLS configuration is used for both the listening socket and outgoing
 	// connections.
 
-	tlsCfg := tlsutil.SecureDefault()
+	var tlsCfg *tls.Config
+	if a.cfg.Options().InsecureAllowOldTLSVersions {
+		l.Infoln("TLS 1.2 is allowed on sync connections. This is less than optimally secure.")
+		tlsCfg = tlsutil.SecureDefaultWithTLS12()
+	} else {
+		tlsCfg = tlsutil.SecureDefaultTLS13()
+	}
 	tlsCfg.Certificates = []tls.Certificate{a.cert}
 	tlsCfg.NextProtos = []string{bepProtocolName}
 	tlsCfg.ClientAuth = tls.RequestClientCert
@@ -269,8 +277,9 @@ func (a *App) startup() error {
 	// Create a wrapper that is then wired after they are both setup.
 	addrLister := &lateAddressLister{}
 
-	discoveryManager := discover.NewManager(a.myID, a.cfg, a.cert, a.evLogger, addrLister)
-	connectionsService := connections.NewService(a.cfg, a.myID, m, tlsCfg, discoveryManager, bepProtocolName, tlsDefaultCommonName, a.evLogger)
+	connRegistry := registry.New()
+	discoveryManager := discover.NewManager(a.myID, a.cfg, a.cert, a.evLogger, addrLister, connRegistry)
+	connectionsService := connections.NewService(a.cfg, a.myID, m, tlsCfg, discoveryManager, bepProtocolName, tlsDefaultCommonName, a.evLogger, connRegistry)
 
 	addrLister.AddressLister = connectionsService
 
@@ -328,8 +337,8 @@ func (a *App) startup() error {
 	return nil
 }
 
-func (a *App) run(ctx context.Context) {
-	err := a.mainService.Serve(ctx)
+func (a *App) wait(errChan <-chan error) {
+	err := <-errChan
 	a.handleMainServiceError(err)
 
 	done := make(chan struct{})

@@ -34,11 +34,14 @@ import (
 	"github.com/syncthing/syncthing/lib/watchaggregator"
 )
 
+// Arbitrary limit that triggers a warning on kqueue systems
+const kqueueItemCountThreshold = 10000
+
 type folder struct {
 	stateTracker
 	config.FolderConfiguration
 	*stats.FolderStatisticsReference
-	ioLimiter *byteSemaphore
+	ioLimiter *util.Semaphore
 
 	localFlags uint32
 
@@ -55,6 +58,7 @@ type folder struct {
 	scanTimer              *time.Timer
 	scanDelay              chan time.Duration
 	initialScanFinished    chan struct{}
+	scanScheduled          chan struct{}
 	versionCleanupInterval time.Duration
 	versionCleanupTimer    *time.Timer
 
@@ -80,6 +84,8 @@ type folder struct {
 
 	puller    puller
 	versioner versioner.Versioner
+
+	warnedKqueue bool
 }
 
 type syncRequest struct {
@@ -91,7 +97,7 @@ type puller interface {
 	pull() (bool, error) // true when successful and should not be retried
 }
 
-func newFolder(model *model, fset *db.FileSet, ignores *ignore.Matcher, cfg config.FolderConfiguration, evLogger events.Logger, ioLimiter *byteSemaphore, ver versioner.Versioner) folder {
+func newFolder(model *model, fset *db.FileSet, ignores *ignore.Matcher, cfg config.FolderConfiguration, evLogger events.Logger, ioLimiter *util.Semaphore, ver versioner.Versioner) folder {
 	f := folder{
 		stateTracker:              newStateTracker(cfg.ID, evLogger),
 		FolderConfiguration:       cfg,
@@ -102,7 +108,7 @@ func newFolder(model *model, fset *db.FileSet, ignores *ignore.Matcher, cfg conf
 		shortID:       model.shortID,
 		fset:          fset,
 		ignores:       ignores,
-		mtimefs:       fset.MtimeFS(),
+		mtimefs:       cfg.Filesystem(fset),
 		modTimeWindow: cfg.ModTimeWindow(),
 		done:          make(chan struct{}),
 
@@ -110,6 +116,7 @@ func newFolder(model *model, fset *db.FileSet, ignores *ignore.Matcher, cfg conf
 		scanTimer:              time.NewTimer(0), // The first scan should be done immediately.
 		scanDelay:              make(chan time.Duration),
 		initialScanFinished:    make(chan struct{}),
+		scanScheduled:          make(chan struct{}, 1),
 		versionCleanupInterval: time.Duration(cfg.Versioning.CleanupIntervalS) * time.Second,
 		versionCleanupTimer:    time.NewTimer(time.Duration(cfg.Versioning.CleanupIntervalS) * time.Second),
 
@@ -204,6 +211,10 @@ func (f *folder) Serve(ctx context.Context) error {
 			l.Debugln(f, "Delaying scan")
 			f.scanTimer.Reset(next)
 
+		case <-f.scanScheduled:
+			l.Debugln(f, "Scan was scheduled")
+			f.scanTimer.Reset(0)
+
 		case fsEvents := <-f.watchChan:
 			l.Debugln(f, "Scan due to watcher")
 			err = f.scanSubdirs(fsEvents)
@@ -236,6 +247,14 @@ func (f *folder) DelayScan(next time.Duration) {
 	select {
 	case f.scanDelay <- next:
 	case <-f.done:
+	}
+}
+
+func (f *folder) ScheduleScan() {
+	// 1-buffered chan
+	select {
+	case f.scanScheduled <- struct{}{}:
+	default:
 	}
 }
 
@@ -315,7 +334,7 @@ func (f *folder) getHealthErrorWithoutIgnores() error {
 	dbPath := locations.Get(locations.Database)
 	if usage, err := fs.NewFilesystem(fs.FilesystemTypeBasic, dbPath).Usage("."); err == nil {
 		if err = config.CheckFreeSpace(f.model.cfg.Options().MinHomeDiskFree, usage); err != nil {
-			return errors.Wrapf(err, "insufficient space on disk for database (%v)", dbPath)
+			return fmt.Errorf("insufficient space on disk for database (%v): %w", dbPath, err)
 		}
 	}
 
@@ -368,17 +387,16 @@ func (f *folder) pull() (success bool, err error) {
 		l.Debugln("Skipping pull of", f.Description(), "due to folder error:", err)
 		return false, err
 	}
-	f.setError(nil)
 
 	// Send only folder doesn't do any io, it only checks for out-of-sync
 	// items that differ in metadata and updates those.
 	if f.Type != config.FolderTypeSendOnly {
 		f.setState(FolderSyncWaiting)
 
-		if err := f.ioLimiter.takeWithContext(f.ctx, 1); err != nil {
+		if err := f.ioLimiter.TakeWithContext(f.ctx, 1); err != nil {
 			return true, err
 		}
-		defer f.ioLimiter.give(1)
+		defer f.ioLimiter.Give(1)
 	}
 
 	startTime := time.Now()
@@ -395,6 +413,7 @@ func (f *folder) pull() (success bool, err error) {
 		l.Debugln("Skipping pull of", f.Description(), "due to folder error:", err)
 		return false, err
 	}
+	f.setError(nil)
 
 	success, err = f.puller.pull()
 
@@ -417,10 +436,6 @@ func (f *folder) scanSubdirs(subDirs []string) error {
 
 	err := f.getHealthErrorAndLoadIgnores()
 	if err != nil {
-		// If there is a health error we set it as the folder error. We do not
-		// clear the folder error if there is no health error, as there might be
-		// an *other* folder error (failed to load ignores, for example). Hence
-		// we do not use the CheckHealth() convenience function here.
 		return err
 	}
 	f.setError(nil)
@@ -439,10 +454,10 @@ func (f *folder) scanSubdirs(subDirs []string) error {
 	f.setState(FolderScanWaiting)
 	defer f.setState(FolderIdle)
 
-	if err := f.ioLimiter.takeWithContext(f.ctx, 1); err != nil {
+	if err := f.ioLimiter.TakeWithContext(f.ctx, 1); err != nil {
 		return err
 	}
-	defer f.ioLimiter.give(1)
+	defer f.ioLimiter.Give(1)
 
 	for i := range subDirs {
 		sub := osutil.NativeFilename(subDirs[i])
@@ -473,16 +488,7 @@ func (f *folder) scanSubdirs(subDirs []string) error {
 	f.setState(FolderScanning)
 	f.clearScanErrors(subDirs)
 
-	batch := newFileInfoBatch(func(fs []protocol.FileInfo) error {
-		if err := f.getHealthErrorWithoutIgnores(); err != nil {
-			l.Debugf("Stopping scan of folder %s due to: %s", f.Description(), err)
-			return err
-		}
-		f.updateLocalsFromScanning(fs)
-		return nil
-	})
-
-	batchAppend := f.scanSubdirsBatchAppendFunc(batch)
+	batch := f.newScanBatch()
 
 	// Schedule a pull after scanning, but only if we actually detected any
 	// changes.
@@ -494,13 +500,13 @@ func (f *folder) scanSubdirs(subDirs []string) error {
 		}
 	}()
 
-	changesHere, err := f.scanSubdirsChangedAndNew(subDirs, batch, batchAppend)
+	changesHere, err := f.scanSubdirsChangedAndNew(subDirs, batch)
 	changes += changesHere
 	if err != nil {
 		return err
 	}
 
-	if err := batch.flush(); err != nil {
+	if err := batch.Flush(); err != nil {
 		return err
 	}
 
@@ -513,13 +519,13 @@ func (f *folder) scanSubdirs(subDirs []string) error {
 	// Do a scan of the database for each prefix, to check for deleted and
 	// ignored files.
 
-	changesHere, err = f.scanSubdirsDeletedAndIgnored(subDirs, batch, batchAppend)
+	changesHere, err = f.scanSubdirsDeletedAndIgnored(subDirs, batch)
 	changes += changesHere
 	if err != nil {
 		return err
 	}
 
-	if err := batch.flush(); err != nil {
+	if err := batch.Flush(); err != nil {
 		return err
 	}
 
@@ -527,58 +533,85 @@ func (f *folder) scanSubdirs(subDirs []string) error {
 	return nil
 }
 
-type batchAppendFunc func(protocol.FileInfo, *db.Snapshot) bool
+const maxToRemove = 1000
 
-func (f *folder) scanSubdirsBatchAppendFunc(batch *fileInfoBatch) batchAppendFunc {
-	// Resolve items which are identical with the global state.
-	switch f.Type {
-	case config.FolderTypeReceiveOnly:
-		return func(fi protocol.FileInfo, snap *db.Snapshot) bool {
-			switch gf, ok := snap.GetGlobal(fi.Name); {
-			case !ok:
-			case gf.IsEquivalentOptional(fi, f.modTimeWindow, false, false, protocol.FlagLocalReceiveOnly):
-				// What we have locally is equivalent to the global file.
-				fi.Version = gf.Version
-				l.Debugf("%v scanning: Merging identical locally changed item with global", f, fi)
-				fallthrough
-			case fi.IsDeleted() && (gf.IsReceiveOnlyChanged() || gf.IsDeleted()):
-				// Our item is deleted and the global item is our own
-				// receive only file or deleted too. In the former
-				// case we can't delete file infos, so we just
-				// pretend it is a normal deleted file (nobody
-				// cares about that).
-				l.Debugf("%v scanning: Marking item as not locally changed", f, fi)
-				fi.LocalFlags &^= protocol.FlagLocalReceiveOnly
-			}
-			batch.append(fi)
-			return true
+type scanBatch struct {
+	f           *folder
+	updateBatch *db.FileInfoBatch
+	toRemove    []string
+}
+
+func (f *folder) newScanBatch() *scanBatch {
+	b := &scanBatch{
+		f:        f,
+		toRemove: make([]string, 0, maxToRemove),
+	}
+	b.updateBatch = db.NewFileInfoBatch(func(fs []protocol.FileInfo) error {
+		if err := b.f.getHealthErrorWithoutIgnores(); err != nil {
+			l.Debugf("Stopping scan of folder %s due to: %s", b.f.Description(), err)
+			return err
 		}
-	case config.FolderTypeReceiveEncrypted:
-		return func(fi protocol.FileInfo, _ *db.Snapshot) bool {
-			// This is a "virtual" parent directory of encrypted files.
-			// We don't track it, but check if anything still exists
-			// within and delete it otherwise.
-			if fi.IsDirectory() && protocol.IsEncryptedParent(fs.PathComponents(fi.Name)) {
-				if names, err := f.mtimefs.DirNames(fi.Name); err == nil && len(names) == 0 {
-					f.mtimefs.Remove(fi.Name)
-				}
-				return false
-			}
-			// Any local change must not be sent as index entry to
-			// remotes and show up as an error in the UI.
-			fi.LocalFlags = protocol.FlagLocalReceiveOnly
-			batch.append(fi)
-			return true
-		}
-	default:
-		return func(fi protocol.FileInfo, _ *db.Snapshot) bool {
-			batch.append(fi)
-			return true
-		}
+		b.f.updateLocalsFromScanning(fs)
+		return nil
+	})
+	return b
+}
+
+func (b *scanBatch) Remove(item string) {
+	b.toRemove = append(b.toRemove, item)
+}
+
+func (b *scanBatch) flushToRemove() {
+	if len(b.toRemove) > 0 {
+		b.f.fset.RemoveLocalItems(b.toRemove)
+		b.toRemove = b.toRemove[:0]
 	}
 }
 
-func (f *folder) scanSubdirsChangedAndNew(subDirs []string, batch *fileInfoBatch, batchAppend batchAppendFunc) (int, error) {
+func (b *scanBatch) Flush() error {
+	b.flushToRemove()
+	return b.updateBatch.Flush()
+}
+
+func (b *scanBatch) FlushIfFull() error {
+	if len(b.toRemove) >= maxToRemove {
+		b.flushToRemove()
+	}
+	return b.updateBatch.FlushIfFull()
+}
+
+// Update adds the fileinfo to the batch for updating, and does a few checks.
+// It returns false if the checks result in the file not going to be updated or removed.
+func (b *scanBatch) Update(fi protocol.FileInfo, snap *db.Snapshot) bool {
+	// Check for a "virtual" parent directory of encrypted files. We don't track
+	// it, but check if anything still exists within and delete it otherwise.
+	if b.f.Type == config.FolderTypeReceiveEncrypted && fi.IsDirectory() && protocol.IsEncryptedParent(fs.PathComponents(fi.Name)) {
+		if names, err := b.f.mtimefs.DirNames(fi.Name); err == nil && len(names) == 0 {
+			b.f.mtimefs.Remove(fi.Name)
+		}
+		return false
+	}
+	// Resolve receive-only items which are identical with the global state or
+	// the global item is our own receive-only item.
+	switch gf, ok := snap.GetGlobal(fi.Name); {
+	case !ok:
+	case gf.IsReceiveOnlyChanged():
+		if fi.IsDeleted() {
+			// Our item is deleted and the global item is our own receive only
+			// file. No point in keeping track of that.
+			b.Remove(fi.Name)
+			return true
+		}
+	case gf.IsEquivalentOptional(fi, b.f.modTimeWindow, false, false, protocol.FlagLocalReceiveOnly):
+		// What we have locally is equivalent to the global file.
+		l.Debugf("%v scanning: Merging identical locally changed item with global", b.f, fi)
+		fi = gf
+	}
+	b.updateBatch.Append(fi)
+	return true
+}
+
+func (f *folder) scanSubdirsChangedAndNew(subDirs []string, batch *scanBatch) (int, error) {
 	changes := 0
 	snap, err := f.dbSnapshot()
 	if err != nil {
@@ -621,7 +654,7 @@ func (f *folder) scanSubdirsChangedAndNew(subDirs []string, batch *fileInfoBatch
 			continue
 		}
 
-		if err := batch.flushIfFull(); err != nil {
+		if err := batch.FlushIfFull(); err != nil {
 			// Prevent a race between the scan aborting due to context
 			// cancellation and releasing the snapshot in defer here.
 			scanCancel()
@@ -630,7 +663,7 @@ func (f *folder) scanSubdirsChangedAndNew(subDirs []string, batch *fileInfoBatch
 			return changes, err
 		}
 
-		if batchAppend(res.File, snap) {
+		if batch.Update(res.File, snap) {
 			changes++
 		}
 
@@ -638,7 +671,7 @@ func (f *folder) scanSubdirsChangedAndNew(subDirs []string, batch *fileInfoBatch
 		case config.FolderTypeReceiveOnly, config.FolderTypeReceiveEncrypted:
 		default:
 			if nf, ok := f.findRename(snap, res.File, alreadyUsedOrExisting); ok {
-				if batchAppend(nf, snap) {
+				if batch.Update(nf, snap) {
 					changes++
 				}
 			}
@@ -648,7 +681,7 @@ func (f *folder) scanSubdirsChangedAndNew(subDirs []string, batch *fileInfoBatch
 	return changes, nil
 }
 
-func (f *folder) scanSubdirsDeletedAndIgnored(subDirs []string, batch *fileInfoBatch, batchAppend batchAppendFunc) (int, error) {
+func (f *folder) scanSubdirsDeletedAndIgnored(subDirs []string, batch *scanBatch) (int, error) {
 	var toIgnore []db.FileInfoTruncated
 	ignoredParent := ""
 	changes := 0
@@ -670,7 +703,7 @@ func (f *folder) scanSubdirsDeletedAndIgnored(subDirs []string, batch *fileInfoB
 
 			file := fi.(db.FileInfoTruncated)
 
-			if err := batch.flushIfFull(); err != nil {
+			if err := batch.FlushIfFull(); err != nil {
 				iterError = err
 				return false
 			}
@@ -679,10 +712,10 @@ func (f *folder) scanSubdirsDeletedAndIgnored(subDirs []string, batch *fileInfoB
 				for _, file := range toIgnore {
 					l.Debugln("marking file as ignored", file)
 					nf := file.ConvertToIgnoredFileInfo()
-					if batchAppend(nf, snap) {
+					if batch.Update(nf, snap) {
 						changes++
 					}
-					if err := batch.flushIfFull(); err != nil {
+					if err := batch.FlushIfFull(); err != nil {
 						iterError = err
 						return false
 					}
@@ -709,7 +742,7 @@ func (f *folder) scanSubdirsDeletedAndIgnored(subDirs []string, batch *fileInfoB
 
 				l.Debugln("marking file as ignored", file)
 				nf := file.ConvertToIgnoredFileInfo()
-				if batchAppend(nf, snap) {
+				if batch.Update(nf, snap) {
 					changes++
 				}
 
@@ -739,23 +772,35 @@ func (f *folder) scanSubdirsDeletedAndIgnored(subDirs []string, batch *fileInfoB
 					nf.Version = protocol.Vector{}
 				}
 				l.Debugln("marking file as deleted", nf)
-				if batchAppend(nf, snap) {
+				if batch.Update(nf, snap) {
 					changes++
 				}
-			case file.IsDeleted() && file.IsReceiveOnlyChanged() && f.Type == config.FolderTypeReceiveOnly && len(snap.Availability(file.Name)) == 0:
-				file.Version = protocol.Vector{}
-				file.LocalFlags &^= protocol.FlagLocalReceiveOnly
-				l.Debugln("marking deleted item that doesn't exist anywhere as not receive-only", file)
-				if batchAppend(file.ConvertDeletedToFileInfo(), snap) {
-					changes++
-				}
-			case file.IsDeleted() && file.IsReceiveOnlyChanged() && f.Type != config.FolderTypeReceiveOnly:
-				// No need to bump the version for a file that was and is
-				// deleted and just the folder type/local flags changed.
-				file.LocalFlags &^= protocol.FlagLocalReceiveOnly
-				l.Debugln("removing receive-only flag on deleted item", file)
-				if batchAppend(file.ConvertDeletedToFileInfo(), snap) {
-					changes++
+			case file.IsDeleted() && file.IsReceiveOnlyChanged():
+				switch f.Type {
+				case config.FolderTypeReceiveOnly, config.FolderTypeReceiveEncrypted:
+					switch gf, ok := snap.GetGlobal(file.Name); {
+					case !ok:
+					case gf.IsReceiveOnlyChanged():
+						l.Debugln("removing deleted, receive-only item that is globally receive-only from db", file)
+						batch.Remove(file.Name)
+						changes++
+					case gf.IsDeleted():
+						// Our item is deleted and the global item is deleted too. We just
+						// pretend it is a normal deleted file (nobody cares about that).
+						l.Debugf("%v scanning: Marking globally deleted item as not locally changed: %v", f, file.Name)
+						file.LocalFlags &^= protocol.FlagLocalReceiveOnly
+						if batch.Update(file.ConvertDeletedToFileInfo(), snap) {
+							changes++
+						}
+					}
+				default:
+					// No need to bump the version for a file that was and is
+					// deleted and just the folder type/local flags changed.
+					file.LocalFlags &^= protocol.FlagLocalReceiveOnly
+					l.Debugln("removing receive-only flag on deleted item", file)
+					if batch.Update(file.ConvertDeletedToFileInfo(), snap) {
+						changes++
+					}
 				}
 			}
 
@@ -772,10 +817,10 @@ func (f *folder) scanSubdirsDeletedAndIgnored(subDirs []string, batch *fileInfoB
 			for _, file := range toIgnore {
 				l.Debugln("marking file as ignored", f)
 				nf := file.ConvertToIgnoredFileInfo()
-				if batchAppend(nf, snap) {
+				if batch.Update(nf, snap) {
 					changes++
 				}
-				if iterError = batch.flushIfFull(); iterError != nil {
+				if iterError = batch.FlushIfFull(); iterError != nil {
 					break
 				}
 			}
@@ -870,10 +915,10 @@ func (f *folder) versionCleanupTimerFired() {
 	f.setState(FolderCleanWaiting)
 	defer f.setState(FolderIdle)
 
-	if err := f.ioLimiter.takeWithContext(f.ctx, 1); err != nil {
+	if err := f.ioLimiter.TakeWithContext(f.ctx, 1); err != nil {
 		return
 	}
-	defer f.ioLimiter.give(1)
+	defer f.ioLimiter.Give(1)
 
 	f.setState(FolderCleaning)
 
@@ -940,10 +985,23 @@ func (f *folder) monitorWatch(ctx context.Context) {
 	warnedOutside := false
 	var lastWatch time.Time
 	pause := time.Minute
+	// Subscribe to folder summaries only on kqueue systems, to warn about potential high resource usage
+	var summarySub events.Subscription
+	var summaryChan <-chan events.Event
+	if fs.WatchKqueue && !f.warnedKqueue {
+		summarySub = f.evLogger.Subscribe(events.FolderSummary)
+		summaryChan = summarySub.C()
+	}
+	defer func() {
+		aggrCancel() // aggrCancel might e re-assigned -> call within closure
+		if summaryChan != nil {
+			summarySub.Unsubscribe()
+		}
+	}()
 	for {
 		select {
 		case <-failTimer.C:
-			eventChan, errChan, err = f.Filesystem().Watch(".", f.ignores, ctx, f.IgnorePerms)
+			eventChan, errChan, err = f.mtimefs.Watch(".", f.ignores, ctx, f.IgnorePerms)
 			// We do this once per minute initially increased to
 			// max one hour in case of repeat failures.
 			f.scanOnWatchErr()
@@ -984,6 +1042,15 @@ func (f *folder) monitorWatch(ctx context.Context) {
 			aggrCancel()
 			errChan = nil
 			aggrCtx, aggrCancel = context.WithCancel(ctx)
+		case ev := <-summaryChan:
+			if data, ok := ev.Data.(FolderSummaryEventData); !ok {
+				f.evLogger.Log(events.Failure, "Unexpected type of folder-summary event in folder.monitorWatch")
+			} else if data.Summary.LocalTotalItems > kqueueItemCountThreshold {
+				f.warnedKqueue = true
+				summarySub.Unsubscribe()
+				summaryChan = nil
+				l.Warnf("Filesystem watching (kqueue) is enabled on %v with a lot of files/directories, and that requires a lot of resources and might slow down your system significantly", f.Description())
+			}
 		case <-ctx.Done():
 			return
 		}
@@ -1206,7 +1273,7 @@ func (f *folder) handleForcedRescans() error {
 		return nil
 	}
 
-	batch := newFileInfoBatch(func(fs []protocol.FileInfo) error {
+	batch := db.NewFileInfoBatch(func(fs []protocol.FileInfo) error {
 		f.fset.Update(protocol.LocalDeviceID, fs)
 		return nil
 	})
@@ -1218,7 +1285,7 @@ func (f *folder) handleForcedRescans() error {
 	defer snap.Release()
 
 	for _, path := range paths {
-		if err := batch.flushIfFull(); err != nil {
+		if err := batch.FlushIfFull(); err != nil {
 			return err
 		}
 
@@ -1227,10 +1294,10 @@ func (f *folder) handleForcedRescans() error {
 			continue
 		}
 		fi.SetMustRescan()
-		batch.append(fi)
+		batch.Append(fi)
 	}
 
-	if err = batch.flush(); err != nil {
+	if err = batch.Flush(); err != nil {
 		return err
 	}
 

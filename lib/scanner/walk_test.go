@@ -13,7 +13,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -39,10 +38,14 @@ type testfile struct {
 
 type testfileList []testfile
 
+const (
+	testFsType     = fs.FilesystemTypeBasic
+	testFsLocation = "testdata"
+)
+
 var (
-	testFs     fs.Filesystem
-	testFsType = fs.FilesystemTypeBasic
-	testdata   = testfileList{
+	testFs   fs.Filesystem
+	testdata = testfileList{
 		{"afile", 4, "b5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae4944c"},
 		{"dir1", 128, ""},
 		{filepath.Join("dir1", "dfile"), 5, "49ae93732fcf8d63fe1cce759664982dbd5b23161f007dba8561862adc96d063"},
@@ -59,7 +62,7 @@ func init() {
 	// potentially taking down the box...
 	rdebug.SetMaxStack(10 * 1 << 20)
 
-	testFs = fs.NewFilesystem(fs.FilesystemTypeBasic, "testdata")
+	testFs = fs.NewFilesystem(testFsType, testFsLocation)
 }
 
 func TestWalkSub(t *testing.T) {
@@ -251,6 +254,62 @@ func TestNormalization(t *testing.T) {
 	}
 }
 
+func TestNormalizationDarwinCaseFS(t *testing.T) {
+	// This tests that normalization works on Darwin, through a CaseFS.
+
+	if runtime.GOOS != "darwin" {
+		t.Skip("Normalization test not possible on non-Darwin")
+		return
+	}
+
+	testFs := fs.NewFilesystem(testFsType, testFsLocation, new(fs.OptionDetectCaseConflicts))
+
+	testFs.RemoveAll("normalization")
+	defer testFs.RemoveAll("normalization")
+	testFs.MkdirAll("normalization", 0755)
+
+	const (
+		inNFC = "\xC3\x84"
+		inNFD = "\x41\xCC\x88"
+	)
+
+	// Create dir in NFC
+	if err := testFs.Mkdir(filepath.Join("normalization", "dir-"+inNFC), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create file in NFC
+	fd, err := testFs.Create(filepath.Join("normalization", "dir-"+inNFC, "file-"+inNFC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd.Close()
+
+	// Walk, which should normalize and return
+	walkDir(testFs, "normalization", nil, nil, 0)
+	tmp := walkDir(testFs, "normalization", nil, nil, 0)
+	if len(tmp) != 3 {
+		t.Error("Expected one file and one dir scanned")
+	}
+
+	// Verify we see the normalized entries in the result
+	foundFile := false
+	foundDir := false
+	for _, f := range tmp {
+		if f.Name == filepath.Join("normalization", "dir-"+inNFD) {
+			foundDir = true
+			continue
+		}
+		if f.Name == filepath.Join("normalization", "dir-"+inNFD, "file-"+inNFD) {
+			foundFile = true
+			continue
+		}
+	}
+	if !foundFile || !foundDir {
+		t.Error("Didn't find expected normalization form")
+	}
+}
+
 func TestIssue1507(t *testing.T) {
 	w := &walker{}
 	w.Matcher = ignore.New(w.Filesystem)
@@ -320,11 +379,7 @@ func TestWalkSymlinkWindows(t *testing.T) {
 
 func TestWalkRootSymlink(t *testing.T) {
 	// Create a folder with a symlink in it
-	tmp, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmp)
+	tmp := t.TempDir()
 	testFs := fs.NewFilesystem(testFsType, tmp)
 
 	link := "link"
@@ -653,11 +708,7 @@ func TestStopWalk(t *testing.T) {
 }
 
 func TestIssue4799(t *testing.T) {
-	tmp, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmp)
+	tmp := t.TempDir()
 
 	fs := fs.NewFilesystem(testFsType, tmp)
 
@@ -715,11 +766,7 @@ func TestRecurseInclude(t *testing.T) {
 }
 
 func TestIssue4841(t *testing.T) {
-	tmp, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmp)
+	tmp := t.TempDir()
 
 	fs := fs.NewFilesystem(testFsType, tmp)
 

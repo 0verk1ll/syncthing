@@ -4,7 +4,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
-// +build go1.14,!noquic,!go1.17
+//go:build go1.15 && !noquic
+// +build go1.15,!noquic
 
 package connections
 
@@ -13,10 +14,8 @@ import (
 	"crypto/tls"
 	"net"
 	"net/url"
-	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/lucas-clemente/quic-go"
@@ -41,13 +40,15 @@ type quicListener struct {
 
 	onAddressesChangedNotifier
 
-	uri     *url.URL
-	cfg     config.Wrapper
-	tlsCfg  *tls.Config
-	conns   chan internalConn
-	factory listenerFactory
+	uri      *url.URL
+	cfg      config.Wrapper
+	tlsCfg   *tls.Config
+	conns    chan internalConn
+	factory  listenerFactory
+	registry *registry.Registry
 
 	address *url.URL
+	laddr   net.Addr
 	mut     sync.Mutex
 }
 
@@ -80,38 +81,50 @@ func (t *quicListener) OnExternalAddressChanged(address *stun.Host, via string) 
 }
 
 func (t *quicListener) serve(ctx context.Context) error {
-	network := strings.ReplaceAll(t.uri.Scheme, "quic", "udp")
+	network := quicNetwork(t.uri)
 
-	packetConn, err := net.ListenPacket(network, t.uri.Host)
+	udpAddr, err := net.ResolveUDPAddr(network, t.uri.Host)
 	if err != nil {
 		l.Infoln("Listen (BEP/quic):", err)
 		return err
 	}
-	defer func() { _ = packetConn.Close() }()
 
-	svc, conn := stun.New(t.cfg, t, packetConn)
-	defer func() { _ = conn.Close() }()
-	wrapped := &stunConnQUICWrapper{
-		PacketConn: conn,
-		underlying: packetConn.(*net.UDPConn),
+	udpConn, err := net.ListenUDP(network, udpAddr)
+	if err != nil {
+		l.Infoln("Listen (BEP/quic):", err)
+		return err
 	}
+	defer func() { _ = udpConn.Close() }()
+
+	svc, conn := stun.New(t.cfg, t, udpConn)
+	defer conn.Close()
 
 	go svc.Serve(ctx)
 
-	registry.Register(t.uri.Scheme, wrapped)
-	defer registry.Unregister(t.uri.Scheme, wrapped)
+	t.registry.Register(t.uri.Scheme, conn)
+	defer t.registry.Unregister(t.uri.Scheme, conn)
 
-	listener, err := quic.Listen(wrapped, t.tlsCfg, quicConfig)
+	listener, err := quic.Listen(conn, t.tlsCfg, quicConfig)
 	if err != nil {
 		l.Infoln("Listen (BEP/quic):", err)
 		return err
 	}
-	t.notifyAddressesChanged(t)
 	defer listener.Close()
+
+	t.notifyAddressesChanged(t)
 	defer t.clearAddresses(t)
 
-	l.Infof("QUIC listener (%v) starting", packetConn.LocalAddr())
-	defer l.Infof("QUIC listener (%v) shutting down", packetConn.LocalAddr())
+	l.Infof("QUIC listener (%v) starting", udpConn.LocalAddr())
+	defer l.Infof("QUIC listener (%v) shutting down", udpConn.LocalAddr())
+
+	t.mut.Lock()
+	t.laddr = udpConn.LocalAddr()
+	t.mut.Unlock()
+	defer func() {
+		t.mut.Lock()
+		t.laddr = nil
+		t.mut.Unlock()
+	}()
 
 	acceptFailures := 0
 	const maxAcceptFailures = 10
@@ -164,8 +177,8 @@ func (t *quicListener) URI() *url.URL {
 }
 
 func (t *quicListener) WANAddresses() []*url.URL {
-	uris := []*url.URL{t.uri}
 	t.mut.Lock()
+	uris := []*url.URL{maybeReplacePort(t.uri, t.laddr)}
 	if t.address != nil {
 		uris = append(uris, t.address)
 	}
@@ -174,9 +187,12 @@ func (t *quicListener) WANAddresses() []*url.URL {
 }
 
 func (t *quicListener) LANAddresses() []*url.URL {
-	addrs := []*url.URL{t.uri}
-	network := strings.ReplaceAll(t.uri.Scheme, "quic", "udp")
-	addrs = append(addrs, getURLsForAllAdaptersIfUnspecified(network, t.uri)...)
+	t.mut.Lock()
+	uri := maybeReplacePort(t.uri, t.laddr)
+	t.mut.Unlock()
+	addrs := []*url.URL{uri}
+	network := quicNetwork(uri)
+	addrs = append(addrs, getURLsForAllAdaptersIfUnspecified(network, uri)...)
 	return addrs
 }
 
@@ -202,13 +218,14 @@ func (f *quicListenerFactory) Valid(config.Configuration) error {
 	return nil
 }
 
-func (f *quicListenerFactory) New(uri *url.URL, cfg config.Wrapper, tlsCfg *tls.Config, conns chan internalConn, natService *nat.Service) genericListener {
+func (f *quicListenerFactory) New(uri *url.URL, cfg config.Wrapper, tlsCfg *tls.Config, conns chan internalConn, natService *nat.Service, registry *registry.Registry) genericListener {
 	l := &quicListener{
-		uri:     fixupPort(uri, config.DefaultQUICPort),
-		cfg:     cfg,
-		tlsCfg:  tlsCfg,
-		conns:   conns,
-		factory: f,
+		uri:      fixupPort(uri, config.DefaultQUICPort),
+		cfg:      cfg,
+		tlsCfg:   tlsCfg,
+		conns:    conns,
+		factory:  f,
+		registry: registry,
 	}
 	l.ServiceWithError = svcutil.AsService(l.serve, l.String())
 	l.nat.Store(stun.NATUnknown)
@@ -217,19 +234,4 @@ func (f *quicListenerFactory) New(uri *url.URL, cfg config.Wrapper, tlsCfg *tls.
 
 func (quicListenerFactory) Enabled(cfg config.Configuration) bool {
 	return true
-}
-
-type stunConnQUICWrapper struct {
-	net.PacketConn
-	underlying *net.UDPConn
-}
-
-// SetReadBuffer is required by QUIC < v0.20.0
-func (s *stunConnQUICWrapper) SetReadBuffer(size int) error {
-	return s.underlying.SetReadBuffer(size)
-}
-
-// SyscallConn is required by QUIC
-func (s *stunConnQUICWrapper) SyscallConn() (syscall.RawConn, error) {
-	return s.underlying.SyscallConn()
 }

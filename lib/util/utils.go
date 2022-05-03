@@ -9,7 +9,6 @@ package util
 import (
 	"context"
 	"fmt"
-	"net"
 	"net/url"
 	"reflect"
 	"strconv"
@@ -231,25 +230,6 @@ func Address(network, host string) string {
 	return u.String()
 }
 
-// AddressUnspecifiedLess is a comparator function preferring least specific network address (most widely listening,
-// namely preferring 0.0.0.0 over some IP), if both IPs are equal, it prefers the less restrictive network (prefers tcp
-// over tcp4)
-func AddressUnspecifiedLess(a, b net.Addr) bool {
-	aIsUnspecified := false
-	bIsUnspecified := false
-	if host, _, err := net.SplitHostPort(a.String()); err == nil {
-		aIsUnspecified = host == "" || net.ParseIP(host).IsUnspecified()
-	}
-	if host, _, err := net.SplitHostPort(b.String()); err == nil {
-		bIsUnspecified = host == "" || net.ParseIP(host).IsUnspecified()
-	}
-
-	if aIsUnspecified == bIsUnspecified {
-		return len(a.Network()) < len(b.Network())
-	}
-	return aIsUnspecified
-}
-
 func CallWithContext(ctx context.Context, fn func() error) error {
 	var err error
 	done := make(chan struct{})
@@ -279,4 +259,16 @@ func NiceDurationString(d time.Duration) string {
 		d = d.Round(time.Microsecond)
 	}
 	return d.String()
+}
+
+func EqualStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

@@ -27,7 +27,7 @@ var errorsCommand = cli.Command{
 		{
 			Name:      "push",
 			Usage:     "Push an error to active clients",
-			ArgsUsage: "[error message]",
+			ArgsUsage: "ERROR-MESSAGE",
 			Action:    expects(1, errorsPush),
 		},
 		{
@@ -39,7 +39,7 @@ var errorsCommand = cli.Command{
 }
 
 func errorsPush(c *cli.Context) error {
-	client := c.App.Metadata["client"].(*APIClient)
+	client := c.App.Metadata["client"].(APIClient)
 	errStr := strings.Join(c.Args(), " ")
 	response, err := client.Post("system/error", strings.TrimSpace(errStr))
 	if err != nil {

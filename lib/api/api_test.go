@@ -13,7 +13,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -36,12 +35,14 @@ import (
 	"github.com/syncthing/syncthing/lib/locations"
 	"github.com/syncthing/syncthing/lib/logger"
 	loggermocks "github.com/syncthing/syncthing/lib/logger/mocks"
+	"github.com/syncthing/syncthing/lib/model"
 	modelmocks "github.com/syncthing/syncthing/lib/model/mocks"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/svcutil"
 	"github.com/syncthing/syncthing/lib/sync"
 	"github.com/syncthing/syncthing/lib/tlsutil"
 	"github.com/syncthing/syncthing/lib/ur"
+	"github.com/syncthing/syncthing/lib/util"
 	"github.com/thejerf/suture/v4"
 )
 
@@ -126,6 +127,7 @@ func TestStopAfterBrokenConfig(t *testing.T) {
 
 	srv := New(protocol.LocalDeviceID, w, "", "syncthing", nil, nil, nil, events.NoopLogger, nil, nil, nil, nil, nil, nil, false).(*service)
 	defer os.Remove(token)
+
 	srv.started = make(chan string)
 
 	sup := suture.New("test", svcutil.SpecWithDebugLogger(l))
@@ -221,7 +223,7 @@ func expectURLToContain(t *testing.T, url, exp string) {
 		return
 	}
 
-	data, err := ioutil.ReadAll(res.Body)
+	data, err := io.ReadAll(res.Body)
 	res.Body.Close()
 	if err != nil {
 		t.Error(err)
@@ -259,7 +261,7 @@ func TestAPIServiceRequests(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cancel()
+	t.Cleanup(cancel)
 
 	cases := []httpTestCase{
 		// /rest/db
@@ -296,6 +298,12 @@ func TestAPIServiceRequests(t *testing.T) {
 			Code:   200,
 			Type:   "application/json",
 			Prefix: "null",
+		},
+		{
+			URL:    "/rest/db/status?folder=default",
+			Code:   200,
+			Type:   "application/json",
+			Prefix: "",
 		},
 
 		// /rest/stats
@@ -465,14 +473,17 @@ func TestAPIServiceRequests(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		t.Log("Testing", tc.URL, "...")
-		testHTTPRequest(t, baseURL, tc, testAPIKey)
+		t.Run(cases[0].URL, func(t *testing.T) {
+			testHTTPRequest(t, baseURL, tc, testAPIKey)
+		})
 	}
 }
 
 // testHTTPRequest tries the given test case, comparing the result code,
 // content type, and result prefix.
 func testHTTPRequest(t *testing.T, baseURL string, tc httpTestCase, apikey string) {
+	// Should not be parallelized, as that just causes timeouts eventually with more test-cases
+
 	timeout := time.Second
 	if tc.Timeout > 0 {
 		timeout = tc.Timeout
@@ -506,7 +517,7 @@ func testHTTPRequest(t *testing.T, baseURL string, tc httpTestCase, apikey strin
 		return
 	}
 
-	data, err := ioutil.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Errorf("Unexpected error reading %s: %v", tc.URL, err)
 		return
@@ -607,7 +618,7 @@ func startHTTP(cfg config.Wrapper) (string, context.CancelFunc, error) {
 	}
 	addrChan := make(chan string)
 	mockedSummary := &modelmocks.FolderSummaryService{}
-	mockedSummary.SummaryReturns(map[string]interface{}{"mocked": true}, nil)
+	mockedSummary.SummaryReturns(new(model.FolderSummary), nil)
 
 	// Instantiate the API service
 	urService := ur.New(cfg, m, connections, false)
@@ -1135,16 +1146,12 @@ func TestBrowse(t *testing.T) {
 
 	pathSep := string(os.PathSeparator)
 
-	tmpDir, err := ioutil.TempDir("", "syncthing")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	if err := os.Mkdir(filepath.Join(tmpDir, "dir"), 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := ioutil.WriteFile(filepath.Join(tmpDir, "file"), []byte("hello"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(tmpDir, "file"), []byte("hello"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Mkdir(filepath.Join(tmpDir, "MiXEDCase"), 0755); err != nil {
@@ -1178,7 +1185,7 @@ func TestBrowse(t *testing.T) {
 
 	for _, tc := range cases {
 		ret := browseFiles(tc.current, fs.FilesystemTypeBasic)
-		if !equalStrings(ret, tc.returns) {
+		if !util.EqualStrings(ret, tc.returns) {
 			t.Errorf("browseFiles(%q) => %q, expected %q", tc.current, ret, tc.returns)
 		}
 	}
@@ -1207,15 +1214,9 @@ func TestPrefixMatch(t *testing.T) {
 }
 
 func TestShouldRegenerateCertificate(t *testing.T) {
-	dir, err := ioutil.TempDir("", "syncthing-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
-
 	// Self signed certificates expiring in less than a month are errored so we
 	// can regenerate in time.
-	crt, err := tlsutil.NewCertificate(filepath.Join(dir, "crt"), filepath.Join(dir, "key"), "foo.example.com", 29)
+	crt, err := tlsutil.NewCertificateInMemory("foo.example.com", 29)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1224,7 +1225,7 @@ func TestShouldRegenerateCertificate(t *testing.T) {
 	}
 
 	// Certificates with at least 31 days of life left are fine.
-	crt, err = tlsutil.NewCertificate(filepath.Join(dir, "crt"), filepath.Join(dir, "key"), "foo.example.com", 31)
+	crt, err = tlsutil.NewCertificateInMemory("foo.example.com", 31)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1234,7 +1235,7 @@ func TestShouldRegenerateCertificate(t *testing.T) {
 
 	if runtime.GOOS == "darwin" {
 		// Certificates with too long an expiry time are not allowed on macOS
-		crt, err = tlsutil.NewCertificate(filepath.Join(dir, "crt"), filepath.Join(dir, "key"), "foo.example.com", 1000)
+		crt, err = tlsutil.NewCertificateInMemory("foo.example.com", 1000)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1255,7 +1256,7 @@ func TestConfigChanges(t *testing.T) {
 			APIKey:     testAPIKey,
 		},
 	}
-	tmpFile, err := ioutil.TempFile("", "syncthing-testConfig-")
+	tmpFile, err := os.CreateTemp("", "syncthing-testConfig-")
 	if err != nil {
 		panic(err)
 	}
@@ -1389,18 +1390,6 @@ func TestSanitizedHostname(t *testing.T) {
 	}
 }
 
-func equalStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
 // runningInContainer returns true if we are inside Docker or LXC. It might
 // be prone to false negatives if things change in the future, but likely
 // not false positives.
@@ -1409,7 +1398,7 @@ func runningInContainer() bool {
 		return false
 	}
 
-	bs, err := ioutil.ReadFile("/proc/1/cgroup")
+	bs, err := os.ReadFile("/proc/1/cgroup")
 	if err != nil {
 		return false
 	}

@@ -10,7 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"mime"
 	"net/http"
 	"os"
@@ -23,7 +23,7 @@ import (
 )
 
 func responseToBArray(response *http.Response) ([]byte, error) {
-	bytes, err := ioutil.ReadAll(response.Body)
+	bytes, err := io.ReadAll(response.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -32,26 +32,38 @@ func responseToBArray(response *http.Response) ([]byte, error) {
 
 func emptyPost(url string) cli.ActionFunc {
 	return func(c *cli.Context) error {
-		client := c.App.Metadata["client"].(*APIClient)
-		_, err := client.Post(url, "")
+		client, err := getClientFactory(c).getClient()
+		if err != nil {
+			return err
+		}
+		_, err = client.Post(url, "")
 		return err
 	}
 }
 
 func indexDumpOutput(url string) cli.ActionFunc {
 	return func(c *cli.Context) error {
-		client := c.App.Metadata["client"].(*APIClient)
-		response, err := client.Get(url)
+		client, err := getClientFactory(c).getClient()
 		if err != nil {
 			return err
 		}
-		return prettyPrintResponse(c, response)
+		response, err := client.Get(url)
+		if errors.Is(err, errNotFound) {
+			return errors.New("not found (folder/file not in database)")
+		}
+		if err != nil {
+			return err
+		}
+		return prettyPrintResponse(response)
 	}
 }
 
 func saveToFile(url string) cli.ActionFunc {
 	return func(c *cli.Context) error {
-		client := c.App.Metadata["client"].(*APIClient)
+		client, err := getClientFactory(c).getClient()
+		if err != nil {
+			return err
+		}
 		response, err := client.Get(url)
 		if err != nil {
 			return err
@@ -82,7 +94,7 @@ func saveToFile(url string) cli.ActionFunc {
 	}
 }
 
-func getConfig(c *APIClient) (config.Configuration, error) {
+func getConfig(c APIClient) (config.Configuration, error) {
 	cfg := config.Configuration{}
 	response, err := c.Get("system/config")
 	if err != nil {
@@ -118,7 +130,7 @@ func prettyPrintJSON(data interface{}) error {
 	return enc.Encode(data)
 }
 
-func prettyPrintResponse(c *cli.Context, response *http.Response) error {
+func prettyPrintResponse(response *http.Response) error {
 	bytes, err := responseToBArray(response)
 	if err != nil {
 		return err
@@ -146,4 +158,8 @@ func nulString(bs []byte) string {
 
 func normalizePath(path string) string {
 	return filepath.ToSlash(filepath.Clean(path))
+}
+
+func getClientFactory(c *cli.Context) *apiClientFactory {
+	return c.App.Metadata["clientFactory"].(*apiClientFactory)
 }

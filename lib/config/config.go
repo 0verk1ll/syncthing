@@ -12,7 +12,6 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/url"
 	"os"
@@ -30,7 +29,7 @@ import (
 
 const (
 	OldestHandledVersion = 10
-	CurrentVersion       = 35
+	CurrentVersion       = 36
 	MaxRescanIntervalS   = 365 * 24 * 60 * 60
 )
 
@@ -114,18 +113,16 @@ func New(myID protocol.DeviceID) Configuration {
 	return cfg
 }
 
-func NewWithFreePorts(myID protocol.DeviceID) (Configuration, error) {
-	cfg := New(myID)
-
+func (cfg *Configuration) ProbeFreePorts() error {
 	port, err := getFreePort("127.0.0.1", DefaultGUIPort)
 	if err != nil {
-		return Configuration{}, errors.Wrap(err, "get free port (GUI)")
+		return errors.Wrap(err, "get free port (GUI)")
 	}
 	cfg.GUI.RawAddress = fmt.Sprintf("127.0.0.1:%d", port)
 
 	port, err = getFreePort("0.0.0.0", DefaultTCPPort)
 	if err != nil {
-		return Configuration{}, errors.Wrap(err, "get free port (BEP)")
+		return errors.Wrap(err, "get free port (BEP)")
 	}
 	if port == DefaultTCPPort {
 		cfg.Options.RawListenAddresses = []string{"default"}
@@ -137,7 +134,7 @@ func NewWithFreePorts(myID protocol.DeviceID) (Configuration, error) {
 		}
 	}
 
-	return cfg, nil
+	return nil
 }
 
 type xmlConfiguration struct {
@@ -163,17 +160,42 @@ func ReadXML(r io.Reader, myID protocol.DeviceID) (Configuration, int, error) {
 }
 
 func ReadJSON(r io.Reader, myID protocol.DeviceID) (Configuration, error) {
-	var cfg Configuration
-
-	util.SetDefaults(&cfg)
-
-	bs, err := ioutil.ReadAll(r)
+	bs, err := io.ReadAll(r)
 	if err != nil {
 		return Configuration{}, err
 	}
 
+	var cfg Configuration
+
+	util.SetDefaults(&cfg)
+
 	if err := json.Unmarshal(bs, &cfg); err != nil {
 		return Configuration{}, err
+	}
+
+	// Unmarshal list of devices and folders separately to set defaults
+	var rawFoldersDevices struct {
+		Folders []json.RawMessage
+		Devices []json.RawMessage
+	}
+	if err := json.Unmarshal(bs, &rawFoldersDevices); err != nil {
+		return Configuration{}, err
+	}
+
+	cfg.Folders = make([]FolderConfiguration, len(rawFoldersDevices.Folders))
+	for i, bs := range rawFoldersDevices.Folders {
+		cfg.Folders[i] = cfg.Defaults.Folder.Copy()
+		if err := json.Unmarshal(bs, &cfg.Folders[i]); err != nil {
+			return Configuration{}, err
+		}
+	}
+
+	cfg.Devices = make([]DeviceConfiguration, len(rawFoldersDevices.Devices))
+	for i, bs := range rawFoldersDevices.Devices {
+		cfg.Devices[i] = cfg.Defaults.Device.Copy()
+		if err := json.Unmarshal(bs, &cfg.Devices[i]); err != nil {
+			return Configuration{}, err
+		}
 	}
 
 	if err := cfg.prepare(myID); err != nil {
@@ -433,13 +455,9 @@ func (cfg *Configuration) FolderMap() map[string]FolderConfiguration {
 // folders that have an encryption password set.
 func (cfg Configuration) FolderPasswords(device protocol.DeviceID) map[string]string {
 	res := make(map[string]string, len(cfg.Folders))
-nextFolder:
 	for _, folder := range cfg.Folders {
-		for _, dev := range folder.Devices {
-			if dev.DeviceID == device && dev.EncryptionPassword != "" {
-				res[folder.ID] = dev.EncryptionPassword
-				continue nextFolder
-			}
+		if dev, ok := folder.Device(device); ok && dev.EncryptionPassword != "" {
+			res[folder.ID] = dev.EncryptionPassword
 		}
 	}
 	return res
@@ -602,4 +620,10 @@ func ensureZeroForNodefault(empty interface{}, target interface{}) {
 		}
 		return len(v) > 0
 	})
+}
+
+func (i Ignores) Copy() Ignores {
+	out := Ignores{Lines: make([]string, len(i.Lines))}
+	copy(out.Lines, i.Lines)
+	return out
 }

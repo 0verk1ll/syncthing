@@ -1,6 +1,7 @@
 // Copyright (C) 2014 Jakob Borg. All rights reserved. Use of this source code
 // is governed by an MIT-style license that can be found in the LICENSE file.
 
+//go:generate -command counterfeiter go run github.com/maxbrunsfeld/counterfeiter/v6
 //go:generate counterfeiter -o mocks/logger.go --fake-name Recorder . Recorder
 
 // Package logger implements a standardized logger with callback functionality
@@ -9,7 +10,6 @@ package logger
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"strings"
@@ -31,7 +31,7 @@ const (
 )
 
 const (
-	DefaultFlags = log.Ltime
+	DefaultFlags = log.Ltime | log.Ldate
 	DebugFlags   = log.Ltime | log.Ldate | log.Lmicroseconds | log.Lshortfile
 )
 
@@ -74,7 +74,7 @@ func New() Logger {
 	if os.Getenv("LOGGER_DISCARD") != "" {
 		// Hack to completely disable logging, for example when running
 		// benchmarks.
-		return newLogger(ioutil.Discard)
+		return newLogger(io.Discard)
 	}
 	return newLogger(controlStripper{os.Stdout})
 }

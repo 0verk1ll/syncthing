@@ -4,6 +4,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//go:generate -command counterfeiter go run github.com/maxbrunsfeld/counterfeiter/v6
 //go:generate counterfeiter -o mocks/buffered_subscription.go --fake-name BufferedSubscription . BufferedSubscription
 
 // Package events provides event subscription and polling functionality.
@@ -34,6 +35,7 @@ const (
 	PendingDevicesChanged
 	DevicePaused
 	DeviceResumed
+	ClusterConfigReceived
 	LocalChangeDetected
 	RemoteChangeDetected
 	LocalIndexUpdated
@@ -117,6 +119,8 @@ func (t EventType) String() string {
 		return "DevicePaused"
 	case DeviceResumed:
 		return "DeviceResumed"
+	case ClusterConfigReceived:
+		return "ClusterConfigReceived"
 	case FolderScanProgress:
 		return "FolderScanProgress"
 	case FolderPaused:
@@ -202,6 +206,8 @@ func UnmarshalEventType(s string) EventType {
 		return DevicePaused
 	case "DeviceResumed":
 		return DeviceResumed
+	case "ClusterConfigReceived":
+		return ClusterConfigReceived
 	case "FolderScanProgress":
 		return FolderScanProgress
 	case "FolderPaused":
@@ -546,8 +552,6 @@ type noopLogger struct{}
 var NoopLogger Logger = &noopLogger{}
 
 func (*noopLogger) Serve(ctx context.Context) error { return nil }
-
-func (*noopLogger) Stop() {}
 
 func (*noopLogger) Log(t EventType, data interface{}) {}
 
